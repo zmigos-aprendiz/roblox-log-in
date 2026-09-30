@@ -1,6 +1,7 @@
 """Galaxy GPU — simulação interativa de galáxias em Taichi.
 
-Renomeado de galaxy_gpu.py. Configuração integrada como dataclasses/enums.
+Física (Simulation) e render (Renderer) são @ti.data_oriented, permitindo
+instanciar sem UI e testar em pytest.
 
 Uso:
     python galaxy.py --preset collision --n 300000 --res 1280 720
@@ -9,8 +10,6 @@ Uso:
 
 Dependências: taichi, numpy. Opcional: pygame (UI padrão), sounddevice (áudio).
 """
-from __future__ import annotations
-
 import argparse
 import logging
 import math
@@ -65,7 +64,7 @@ QUALITY_PROFILES: dict[Quality, QualityProfile] = {
     Quality.HIGH:   QualityProfile(1280, 720, 300_000, 2, 1),
 }
 
-# Constantes físicas / de render — antes espalhadas como literais.
+# Constantes físicas / de render.
 EPS: float = 9e-4
 RC: float = 0.02
 DT: float = 0.004
@@ -80,7 +79,7 @@ def _normalized_gaussian(n: int = 6, denom: float = 18.0) -> tuple[float, ...]:
     return tuple(w / total for w in raw)
 
 
-BLOOM_KERNEL: tuple[float, ...] = _normalized_gaussian()
+KW: tuple[float, ...] = _normalized_gaussian()
 
 
 @dataclass(frozen=True)
@@ -150,36 +149,10 @@ def parse_config(argv: list[str] | None = None) -> Config:
 
 
 A: Config = parse_config()
-N = A.n
-W, H = A.width, A.height
-QW, QH = A.quarter_w, A.quarter_h
-ASP = A.aspect
-KW = BLOOM_KERNEL
-
 ti.init(arch=ti.cpu if A.use_cpu else ti.gpu)
 
 
-# ================================================================ STATE
-pos = ti.Vector.field(2, ti.f32, N)
-vel = ti.Vector.field(2, ti.f32, N)
-col = ti.Vector.field(3, ti.f32, N)
-p3 = ti.Vector.field(3, ti.f32, N)
-zoff = ti.field(ti.f32, N)
-gid = ti.field(ti.i32, N)
-img = ti.Vector.field(3, ti.f32, (W, H))
-out = ti.Vector.field(3, ti.f32, (W, H))
-bl = ti.Vector.field(3, ti.f32, (QW, QH))
-bl2 = ti.Vector.field(3, ti.f32, (QW, QH))
-cp = ti.Vector.field(2, ti.f32, 2)
-cv = ti.Vector.field(2, ti.f32, 2)
-cm = ti.field(ti.f32, 2)
-nc = ti.field(ti.i32, ())
-pal = ti.field(ti.i32, ())
-outu = ti.field(ti.u8, shape=(H, W, 3))
-na = ti.field(ti.i32, ())
-P = ti.field(ti.f32, 8)  # 0 G, 1 halo, 2 mouse, 3 dt, 4 brilho, 5 rastro, 6 bloom
-
-
+# ================================================================ RUNTIME STATE
 @dataclass
 class SimState:
     """Parâmetros controláveis em runtime pela UI."""
@@ -205,7 +178,6 @@ class RuntimeParams:
 
 S = SimState()
 Q = RuntimeParams(sub=A.substeps)
-na[None] = N
 if not A.bloom_enabled:
     S.bloom = 0.0
 
@@ -214,246 +186,324 @@ _lvl_lock = threading.Lock()
 lvl = [0.0]
 
 
-# ================================================================ SIM
-@ti.func
-def spawn(i):
-    n = nc[None]
-    g = 0
-    if n == 2 and i % 5 >= 3:
-        g = 1
-    gid[i] = g
-    s = ti.select(n == 2, 0.22 * (1.0 - 0.2 * g), 0.42)
-    r = 0.02 - ti.log(1.0 - 0.98 * ti.random()) * s * 0.28
-    a = ti.random() * 2 * math.pi
-    if ti.random() < 0.7:
-        a = ti.cast(ti.random() * 2, ti.i32) * math.pi + 2.2 * ti.log(r / 0.02) + (ti.random() + ti.random() - 1) * 0.45
-    d = ti.Vector([ti.cos(a), ti.sin(a)])
-    acc = P[0] * cm[g] * r / (r * r + EPS) ** 1.5 + P[1] * cm[g] * r / (r * r + RC)
-    v = ti.sqrt(r * acc) * (0.92 + 0.16 * ti.random())
-    pos[i] = cp[g] + d * r
-    vel[i] = cv[g] + ti.Vector([-d.y, d.x]) * v
-    zoff[i] = (ti.random() - 0.5) * (0.01 + 0.05 * ti.exp(-r / 0.06))
-    p3[i] = ti.Vector([pos[i].x - ASP / 2, zoff[i], pos[i].y - 0.5])
+# ================================================================ SIMULATION
+@ti.data_oriented
+class Simulation:
+    """Física: partículas orbitando 1 ou 2 centros analíticos + força do mouse.
 
+    Todos os kernels que tocam estado físico vivem aqui. A UI só interage via
+    `load()`, `reset()`, `set_params()` e `tick()`. O Renderer lê os campos
+    `pos`, `col`, `p3` e `na` diretamente.
+    """
 
-@ti.kernel
-def reset():
-    for i in pos:
-        spawn(i)
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.N = cfg.n
+        self.ASP = cfg.aspect
 
+        # Estado das partículas
+        self.pos = ti.Vector.field(2, ti.f32, self.N)
+        self.vel = ti.Vector.field(2, ti.f32, self.N)
+        self.col = ti.Vector.field(3, ti.f32, self.N)
+        self.p3 = ti.Vector.field(3, ti.f32, self.N)
+        self.zoff = ti.field(ti.f32, self.N)
+        self.gid = ti.field(ti.i32, self.N)
 
-@ti.kernel
-def move_centers():
-    """Leapfrog KDK nos centros — conserva energia melhor que Euler."""
-    dt = P[3]
-    if nc[None] == 2:
-        d = cp[1] - cp[0]
-        a = P[0] * d / (d.norm_sqr() + EPS) ** 1.5
-        cv[0] += a * cm[1] * 0.5 * dt
-        cv[1] -= a * cm[0] * 0.5 * dt
-        cp[0] += cv[0] * dt
-        cp[1] += cv[1] * dt
-        d = cp[1] - cp[0]
-        a = P[0] * d / (d.norm_sqr() + EPS) ** 1.5
-        cv[0] += a * cm[1] * 0.5 * dt
-        cv[1] -= a * cm[0] * 0.5 * dt
+        # Centros galácticos
+        self.cp = ti.Vector.field(2, ti.f32, 2)
+        self.cv = ti.Vector.field(2, ti.f32, 2)
+        self.cm = ti.field(ti.f32, 2)
+        self.nc = ti.field(ti.i32, ())
 
+        # Parâmetros compartilhados com os kernels: [g, halo, mouse, dt]
+        self.SP = ti.field(ti.f32, 4)
+        self.pal = ti.field(ti.i32, ())
+        self.na = ti.field(ti.i32, ())
+        self.na[None] = self.N
 
-@ti.func
-def accel(p, mx, my, mode, n):
-    """Aceleração total numa posição: 2 centros + força do mouse."""
-    a = ti.Vector([0.0, 0.0])
-    for c in ti.static(range(2)):
-        if c < n:
-            d = cp[c] - p
-            r2 = d.norm_sqr()
-            a += P[0] * cm[c] * d / (r2 + EPS) ** 1.5 + P[1] * cm[c] * d / (r2 + RC)
-    if mode != 0:
-        m = ti.Vector([mx, my]) - p
-        a += mode * P[2] * m / (m.norm_sqr() + 1.6e-3) ** 1.5
-    return a
+    # -------------------------------------------------------- ti.func helpers
+    @ti.func
+    def _accel(self, p, mx, my, mode, n):
+        """Aceleração total numa posição: 2 centros + força do mouse."""
+        a = ti.Vector([0.0, 0.0])
+        for c in ti.static(range(2)):
+            if c < n:
+                d = self.cp[c] - p
+                r2 = d.norm_sqr()
+                a += self.SP[0] * self.cm[c] * d / (r2 + EPS) ** 1.5 \
+                   + self.SP[1] * self.cm[c] * d / (r2 + RC)
+        if mode != 0:
+            m = ti.Vector([mx, my]) - p
+            a += mode * self.SP[2] * m / (m.norm_sqr() + 1.6e-3) ** 1.5
+        return a
 
-
-@ti.kernel
-def step(mx: ti.f32, my: ti.f32, mode: ti.i32):
-    """Leapfrog KDK por partícula (kick-drift-kick)."""
-    dt = P[3]
-    hdt = 0.5 * dt
-    n = nc[None]
-    for i in range(na[None]):
-        p = pos[i]
-        v = vel[i]
-        v += accel(p, mx, my, mode, n) * hdt
-        p = p + v * dt
-        v += accel(p, mx, my, mode, n) * hdt
-
-        pos[i] = p
-        vel[i] = v
-        q = p
-        if q.x < -0.5 or q.x >= ASP + 0.5 or q.y < -0.5 or q.y >= 1.5:
-            spawn(i)
-        p3[i] = ti.Vector([pos[i].x - ASP / 2, zoff[i], pos[i].y - 0.5])
-        g = gid[i]
-        s = ti.min((vel[i] - cv[g]).norm() / 2.2, 1.0)
-        k = ti.min((cp[g] - pos[i]).norm() / 0.35, 1.0)
-        if pal[None] == 0:
-            col[i] = ti.Vector([s ** 0.6, 0.35 + 0.65 * s, 1.0 - 0.5 * s])
-        elif pal[None] == 1:
-            col[i] = ti.Vector([1.0, 0.25 + 0.6 * s, 0.05 + 0.7 * s * s])
-        elif pal[None] == 2:
-            col[i] = ti.Vector([1.0 - 0.65 * k, 0.75 - 0.15 * k, 0.35 + 0.65 * k])
-        elif g == 0:
-            col[i] = ti.Vector([0.3, 0.7, 1.0]) * (0.5 + 0.5 * s)
-        else:
-            col[i] = ti.Vector([1.0, 0.5, 0.25]) * (0.5 + 0.5 * s)
-
-
-# ================================================================ RENDER
-@ti.kernel
-def splat():
-    for x, y in img:
-        img[x, y] *= P[5]
-    for i in range(na[None]):
-        ix = ti.cast(pos[i] * H, ti.i32)
-        if 0 <= ix.x < W and 0 <= ix.y < H:
-            img[ix] += col[i] * P[4]
-
-
-@ti.kernel
-def splat3d(yaw: ti.f32, pitch: ti.f32, dist: ti.f32):
-    for x, y in img:
-        img[x, y] *= P[5]
-    cy, sy, cx, sx = ti.cos(yaw), ti.sin(yaw), ti.cos(pitch), ti.sin(pitch)
-    for i in range(na[None]):
-        q = p3[i]
-        x1 = q.x * cy + q.z * sy
-        z1 = -q.x * sy + q.z * cy
-        y2 = q.y * cx - z1 * sx
-        z2 = q.y * sx + z1 * cx + dist
-        if z2 > 0.05:
-            f = 1.6 * H / z2
-            ix = ti.cast(ti.Vector([W * 0.5 + x1 * f, H * 0.5 + y2 * f]), ti.i32)
-            if 0 <= ix.x < W and 0 <= ix.y < H:
-                img[ix] += col[i] * P[4] * ti.min(dist / z2, 2.0)
-
-
-@ti.kernel
-def bloom_down():
-    for x, y in bl:
-        s = ti.Vector([0.0, 0.0, 0.0])
-        for i, j in ti.static(ti.ndrange(4, 4)):
-            s += img[x * 4 + i, y * 4 + j]
-        bl[x, y] = s / 16
-
-
-@ti.kernel
-def blur_h():
-    for x, y in bl2:
-        a = ti.Vector([0.0, 0.0, 0.0])
-        for j in ti.static(range(13)):
-            a += bl[ti.min(ti.max(x + j - 6, 0), QW - 1), y] * KW[j]
-        bl2[x, y] = a
-
-
-@ti.kernel
-def blur_v():
-    for x, y in bl:
-        a = ti.Vector([0.0, 0.0, 0.0])
-        for j in ti.static(range(13)):
-            a += bl2[x, ti.min(ti.max(y + j - 6, 0), QH - 1)] * KW[j]
-        bl[x, y] = a
-
-
-@ti.func
-def samp(x, y):
-    """Bilinear sample do buffer de bloom."""
-    fx, fy = x - 0.5, y - 0.5
-    x0, y0 = ti.cast(ti.floor(fx), ti.i32), ti.cast(ti.floor(fy), ti.i32)
-    tx, ty = fx - x0, fy - y0
-    xa, xb = ti.min(ti.max(x0, 0), QW - 1), ti.min(ti.max(x0 + 1, 0), QW - 1)
-    ya, yb = ti.min(ti.max(y0, 0), QH - 1), ti.min(ti.max(y0 + 1, 0), QH - 1)
-    return (bl[xa, ya] * (1 - tx) + bl[xb, ya] * tx) * (1 - ty) + (bl[xa, yb] * (1 - tx) + bl[xb, yb] * tx) * ty
-
-
-@ti.kernel
-def compose_u8():
-    """Tone-map + gamma + u8 num passe único (caminho pygame, com Y-flip)."""
-    for x, y in img:
-        c = (img[x, y] + P[6] * samp((x + 0.5) / 4, (y + 0.5) / 4)) * EXPO
-        for k in ti.static(range(3)):
-            lin = 1.0 - ti.exp(-c[k])
-            v = ti.pow(lin, GAMMA) * 255.0 + 0.5
-            outu[H - 1 - y, x, k] = ti.cast(ti.min(v, 255.0), ti.u8)
-
-
-@ti.kernel
-def compose():
-    """Tone-map + gamma em float (caminho GGUI, canvas consome `out`)."""
-    for x, y in out:
-        c = (img[x, y] + P[6] * samp((x + 0.5) / 4, (y + 0.5) / 4)) * EXPO
-        out[x, y] = ti.Vector([
-            ti.pow(1 - ti.exp(-c[0]), GAMMA),
-            ti.pow(1 - ti.exp(-c[1]), GAMMA),
-            ti.pow(1 - ti.exp(-c[2]), GAMMA),
+    @ti.func
+    def _spawn(self, i):
+        """Reposiciona a partícula i numa órbita aproximadamente circular."""
+        n = self.nc[None]
+        g = 0
+        if n == 2 and i % 5 >= 3:
+            g = 1
+        self.gid[i] = g
+        s = ti.select(n == 2, 0.22 * (1.0 - 0.2 * g), 0.42)
+        r = 0.02 - ti.log(1.0 - 0.98 * ti.random()) * s * 0.28
+        a = ti.random() * 2 * math.pi
+        if ti.random() < 0.7:
+            a = ti.cast(ti.random() * 2, ti.i32) * math.pi \
+              + 2.2 * ti.log(r / 0.02) + (ti.random() + ti.random() - 1) * 0.45
+        d = ti.Vector([ti.cos(a), ti.sin(a)])
+        acc = self.SP[0] * self.cm[g] * r / (r * r + EPS) ** 1.5 \
+            + self.SP[1] * self.cm[g] * r / (r * r + RC)
+        v = ti.sqrt(r * acc) * (0.92 + 0.16 * ti.random())
+        self.pos[i] = self.cp[g] + d * r
+        self.vel[i] = self.cv[g] + ti.Vector([-d.y, d.x]) * v
+        self.zoff[i] = (ti.random() - 0.5) * (0.01 + 0.05 * ti.exp(-r / 0.06))
+        self.p3[i] = ti.Vector([
+            self.pos[i].x - self.ASP / 2,
+            self.zoff[i],
+            self.pos[i].y - 0.5,
         ])
 
+    # -------------------------------------------------------- kernels
+    @ti.kernel
+    def _move_centers(self):
+        """Leapfrog KDK nos centros — conserva energia melhor que Euler."""
+        dt = self.SP[3]
+        if self.nc[None] == 2:
+            d = self.cp[1] - self.cp[0]
+            a = self.SP[0] * d / (d.norm_sqr() + EPS) ** 1.5
+            self.cv[0] += a * self.cm[1] * 0.5 * dt
+            self.cv[1] -= a * self.cm[0] * 0.5 * dt
+            self.cp[0] += self.cv[0] * dt
+            self.cp[1] += self.cv[1] * dt
+            d = self.cp[1] - self.cp[0]
+            a = self.SP[0] * d / (d.norm_sqr() + EPS) ** 1.5
+            self.cv[0] += a * self.cm[1] * 0.5 * dt
+            self.cv[1] -= a * self.cm[0] * 0.5 * dt
 
-# ================================================================ HELPERS
-def push() -> None:
+    @ti.kernel
+    def _step(self, mx: ti.f32, my: ti.f32, mode: ti.i32):
+        """Leapfrog KDK por partícula (kick-drift-kick)."""
+        dt = self.SP[3]
+        hdt = 0.5 * dt
+        n = self.nc[None]
+        for i in range(self.na[None]):
+            p = self.pos[i]
+            v = self.vel[i]
+            v += self._accel(p, mx, my, mode, n) * hdt
+            p = p + v * dt
+            v += self._accel(p, mx, my, mode, n) * hdt
+
+            self.pos[i] = p
+            self.vel[i] = v
+            q = p
+            if q.x < -0.5 or q.x >= self.ASP + 0.5 or q.y < -0.5 or q.y >= 1.5:
+                self._spawn(i)
+            self.p3[i] = ti.Vector([
+                self.pos[i].x - self.ASP / 2,
+                self.zoff[i],
+                self.pos[i].y - 0.5,
+            ])
+            g = self.gid[i]
+            s = ti.min((self.vel[i] - self.cv[g]).norm() / 2.2, 1.0)
+            k = ti.min((self.cp[g] - self.pos[i]).norm() / 0.35, 1.0)
+            if self.pal[None] == 0:
+                self.col[i] = ti.Vector([s ** 0.6, 0.35 + 0.65 * s, 1.0 - 0.5 * s])
+            elif self.pal[None] == 1:
+                self.col[i] = ti.Vector([1.0, 0.25 + 0.6 * s, 0.05 + 0.7 * s * s])
+            elif self.pal[None] == 2:
+                self.col[i] = ti.Vector([1.0 - 0.65 * k, 0.75 - 0.15 * k, 0.35 + 0.65 * k])
+            elif g == 0:
+                self.col[i] = ti.Vector([0.3, 0.7, 1.0]) * (0.5 + 0.5 * s)
+            else:
+                self.col[i] = ti.Vector([1.0, 0.5, 0.25]) * (0.5 + 0.5 * s)
+
+    @ti.kernel
+    def _reset(self):
+        for i in self.pos:
+            self._spawn(i)
+
+    # -------------------------------------------------------- Python-side API
+    def set_params(self, *, g: float, halo: float, mouse: float,
+                   dt: float, pal: int) -> None:
+        """Empurra os parâmetros controláveis para a GPU."""
+        self.SP.from_numpy(np.array([g, halo, mouse, dt], np.float32))
+        self.pal[None] = pal
+
+    def load(self, k: int) -> None:
+        """Configura 1 (galáxia única) ou 2 (colisão). Não toca em paleta."""
+        self.nc[None] = k
+        self.cm.from_numpy(np.array([1.0, 0.8], np.float32))
+        if k == 1:
+            self.cp.from_numpy(np.tile(np.array([self.ASP / 2, 0.5], np.float32), (2, 1)))
+            self.cv.from_numpy(np.zeros((2, 2), np.float32))
+        else:
+            self.cp.from_numpy(np.array(
+                [[0.32 * self.ASP, 0.42], [0.68 * self.ASP, 0.60]], np.float32))
+            self.cv.from_numpy(np.array(
+                [[0.35, 0.12], [-0.4375, -0.15]], np.float32))
+        self._reset()
+
+    def reset(self) -> None:
+        self._reset()
+
+    def tick(self, mx: float, my: float, mode: int, substeps: int) -> None:
+        """Avança a simulação `substeps` vezes com o mesmo input."""
+        for _ in range(substeps):
+            self._move_centers()
+            self._step(mx, my, mode)
+
+
+# ================================================================ RENDERER
+@ti.data_oriented
+class Renderer:
+    """Splat aditivo, bloom separável e composição tone-mapped.
+
+    Depende de `Simulation` apenas para ler `pos`/`col`/`p3`/`na`.
+    """
+
+    def __init__(self, cfg: Config, sim: Simulation) -> None:
+        self.cfg = cfg
+        self.sim = sim
+        self.W = cfg.width
+        self.H = cfg.height
+        self.QW = cfg.quarter_w
+        self.QH = cfg.quarter_h
+
+        self.img = ti.Vector.field(3, ti.f32, (self.W, self.H))
+        self.out = ti.Vector.field(3, ti.f32, (self.W, self.H))
+        self.bl = ti.Vector.field(3, ti.f32, (self.QW, self.QH))
+        self.bl2 = ti.Vector.field(3, ti.f32, (self.QW, self.QH))
+        self.outu = ti.field(ti.u8, shape=(self.H, self.W, 3))
+
+        # Parâmetros de render: [br, fade, bloom]
+        self.RP = ti.field(ti.f32, 3)
+
+    # -------------------------------------------------------- ti.func helpers
+    @ti.func
+    def _samp(self, x, y):
+        """Sample bilinear do buffer de bloom."""
+        fx, fy = x - 0.5, y - 0.5
+        x0, y0 = ti.cast(ti.floor(fx), ti.i32), ti.cast(ti.floor(fy), ti.i32)
+        tx, ty = fx - x0, fy - y0
+        xa = ti.min(ti.max(x0, 0), self.QW - 1)
+        xb = ti.min(ti.max(x0 + 1, 0), self.QW - 1)
+        ya = ti.min(ti.max(y0, 0), self.QH - 1)
+        yb = ti.min(ti.max(y0 + 1, 0), self.QH - 1)
+        return (self.bl[xa, ya] * (1 - tx) + self.bl[xb, ya] * tx) * (1 - ty) \
+             + (self.bl[xa, yb] * (1 - tx) + self.bl[xb, yb] * tx) * ty
+
+    # -------------------------------------------------------- kernels
+    @ti.kernel
+    def splat(self):
+        for x, y in self.img:
+            self.img[x, y] *= self.RP[1]
+        for i in range(self.sim.na[None]):
+            ix = ti.cast(self.sim.pos[i] * self.H, ti.i32)
+            if 0 <= ix.x < self.W and 0 <= ix.y < self.H:
+                self.img[ix] += self.sim.col[i] * self.RP[0]
+
+    @ti.kernel
+    def splat3d(self, yaw: ti.f32, pitch: ti.f32, dist: ti.f32):
+        for x, y in self.img:
+            self.img[x, y] *= self.RP[1]
+        cy, sy, cx, sx = ti.cos(yaw), ti.sin(yaw), ti.cos(pitch), ti.sin(pitch)
+        for i in range(self.sim.na[None]):
+            q = self.sim.p3[i]
+            x1 = q.x * cy + q.z * sy
+            z1 = -q.x * sy + q.z * cy
+            y2 = q.y * cx - z1 * sx
+            z2 = q.y * sx + z1 * cx + dist
+            if z2 > 0.05:
+                f = 1.6 * self.H / z2
+                ix = ti.cast(ti.Vector([
+                    self.W * 0.5 + x1 * f,
+                    self.H * 0.5 + y2 * f,
+                ]), ti.i32)
+                if 0 <= ix.x < self.W and 0 <= ix.y < self.H:
+                    self.img[ix] += self.sim.col[i] * self.RP[0] * ti.min(dist / z2, 2.0)
+
+    @ti.kernel
+    def bloom_down(self):
+        for x, y in self.bl:
+            s = ti.Vector([0.0, 0.0, 0.0])
+            for i, j in ti.static(ti.ndrange(4, 4)):
+                s += self.img[x * 4 + i, y * 4 + j]
+            self.bl[x, y] = s / 16
+
+    @ti.kernel
+    def blur_h(self):
+        for x, y in self.bl2:
+            a = ti.Vector([0.0, 0.0, 0.0])
+            for j in ti.static(range(13)):
+                a += self.bl[ti.min(ti.max(x + j - 6, 0), self.QW - 1), y] * KW[j]
+            self.bl2[x, y] = a
+
+    @ti.kernel
+    def blur_v(self):
+        for x, y in self.bl:
+            a = ti.Vector([0.0, 0.0, 0.0])
+            for j in ti.static(range(13)):
+                a += self.bl2[x, ti.min(ti.max(y + j - 6, 0), self.QH - 1)] * KW[j]
+            self.bl[x, y] = a
+
+    @ti.kernel
+    def compose_u8(self):
+        """Tone-map + gamma + u8 + Y-flip num passe único (caminho pygame)."""
+        for x, y in self.img:
+            c = (self.img[x, y] + self.RP[2] * self._samp((x + 0.5) / 4, (y + 0.5) / 4)) * EXPO
+            for k in ti.static(range(3)):
+                lin = 1.0 - ti.exp(-c[k])
+                v = ti.pow(lin, GAMMA) * 255.0 + 0.5
+                self.outu[self.H - 1 - y, x, k] = ti.cast(ti.min(v, 255.0), ti.u8)
+
+    @ti.kernel
+    def compose(self):
+        """Tone-map + gamma em float (caminho GGUI; canvas lê `out`)."""
+        for x, y in self.out:
+            c = (self.img[x, y] + self.RP[2] * self._samp((x + 0.5) / 4, (y + 0.5) / 4)) * EXPO
+            self.out[x, y] = ti.Vector([
+                ti.pow(1 - ti.exp(-c[0]), GAMMA),
+                ti.pow(1 - ti.exp(-c[1]), GAMMA),
+                ti.pow(1 - ti.exp(-c[2]), GAMMA),
+            ])
+
+    # -------------------------------------------------------- Python-side API
+    def set_params(self, *, br: float, fade: float, bloom: float) -> None:
+        self.RP.from_numpy(np.array([br, fade, bloom], np.float32))
+
+    def _bloom_pass(self) -> None:
+        self.bloom_down()
+        for _ in range(2):
+            self.blur_h()
+            self.blur_v()
+
+    def post_pygame(self, bloom_level: float) -> None:
+        if bloom_level > 0.01:
+            self._bloom_pass()
+        self.compose_u8()
+
+    def post_ggui(self, bloom_level: float) -> None:
+        if bloom_level > 0.01:
+            self._bloom_pass()
+        self.compose()
+
+
+# ================================================================ GLUE
+def push_state(sim: Simulation, ren: Renderer) -> None:
+    """Sincroniza o estado Python (S/Q/lvl) para os campos GPU de sim e render."""
     with _lvl_lock:
         l = lvl[0]
     dt = 0.0 if S.pause else DT * S.time * 2 / Q.sub
-    P.from_numpy(np.array(
-        [S.g, S.halo, S.mouse, dt, S.br * (1 + 2.5 * l),
-         S.fade, S.bloom * (1 + l), 0],
-        np.float32,
-    ))
-    pal[None] = S.pal
+    sim.set_params(g=S.g, halo=S.halo, mouse=S.mouse, dt=dt, pal=S.pal)
+    ren.set_params(br=S.br * (1 + 2.5 * l), fade=S.fade, bloom=S.bloom * (1 + l))
 
 
-def load(k: int, *, preserve_palette: bool = False) -> None:
-    """Configura 1 (galáxia única) ou 2 (colisão) e reinicia o estado."""
-    nc[None] = k
-    cm.from_numpy(np.array([1.0, 0.8], np.float32))
-    if k == 1:
-        cp.from_numpy(np.tile(np.array([ASP / 2, 0.5], np.float32), (2, 1)))
-        cv.from_numpy(np.zeros((2, 2), np.float32))
-    else:
-        cp.from_numpy(np.array([[0.32 * ASP, 0.42], [0.68 * ASP, 0.60]], np.float32))
-        cv.from_numpy(np.array([[0.35, 0.12], [-0.4375, -0.15]], np.float32))
+def load_scene(sim: Simulation, k: int, *, preserve_palette: bool = False) -> None:
+    """Carrega preset k. Se `preserve_palette`, mantém a paleta atual do usuário."""
     if not preserve_palette:
         S.pal = 0 if k == 1 else 3
-    push()
-    reset()
-
-
-def sim(mx: float, my: float, mode: int) -> None:
-    for _ in range(Q.sub):
-        move_centers()
-        step(mx, my, mode)
-
-
-def post_bloom() -> None:
-    if S.bloom > 0.01:
-        bloom_down()
-        for _ in range(2):
-            blur_h()
-            blur_v()
-
-
-def post_pygame() -> None:
-    post_bloom()
-    compose_u8()
-
-
-def post_ggui() -> None:
-    post_bloom()
-    compose()
-
-
-def draw2d() -> None:
-    splat()
-    post_ggui()
+    sim.load(k)
 
 
 def stamp() -> str:
@@ -492,8 +542,8 @@ class Extras:
             with _lvl_lock:
                 lvl[0] = 0.0
         if S.rec and not self.rec and can_rec:
-            self.rec = ti.tools.VideoManager(f"rec_{stamp()}", framerate=30,
-                                             automatic_build=False)
+            self.rec = ti.tools.VideoManager(
+                f"rec_{stamp()}", framerate=30, automatic_build=False)
         elif not S.rec and self.rec:
             try:
                 self.rec.make_video(gif=True, mp4=False)
@@ -511,11 +561,13 @@ H painel | A microfone | G gravar GIF | X screenshot | Q restaurar qualidade | F
 
 
 # ================================================================ UI PYGAME
-def run_pygame() -> None:
+def run_pygame(sim: Simulation, ren: Renderer) -> None:
     import pygame
+    W, H = ren.W, ren.H
     pygame.init()
     try:
-        screen = pygame.display.set_mode((W, H), pygame.SCALED | pygame.RESIZABLE, vsync=1)
+        screen = pygame.display.set_mode(
+            (W, H), pygame.SCALED | pygame.RESIZABLE, vsync=1)
     except Exception:
         screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption("Galaxy GPU")
@@ -551,9 +603,9 @@ def run_pygame() -> None:
     SL = [("g", "Gravidade", 0.1, 1.5), ("halo", "Halo", 0.0, 1.5), ("mouse", "Mouse", 0.0, 4.0),
           ("time", "Tempo", 0.0, 3.0), ("br", "Brilho", 0.02, 0.6), ("fade", "Rastro", 0.6, 0.98),
           ("bloom", "Bloom", 0.0, 3.0)]
-    BT = [("Única", lambda: load(1, preserve_palette=True), None),
-          ("Colisão", lambda: load(2, preserve_palette=True), None),
-          ("Reiniciar", reset, None),
+    BT = [("Única", lambda: load_scene(sim, 1, preserve_palette=True), None),
+          ("Colisão", lambda: load_scene(sim, 2, preserve_palette=True), None),
+          ("Reiniciar", sim.reset, None),
           ("Pausar", lambda: tog("pause"), "pause"),
           ("3D", lambda: tog("v3d"), "v3d"),
           ("Paleta", cyc, None),
@@ -567,11 +619,13 @@ def run_pygame() -> None:
     for _ in SL:
         r = pygame.Rect(x0 + 6, y, pw - 12, rh - 2)
         slr.append(r)
-        bars.append(pygame.Rect(r.x + int(r.w * 0.45), r.y + rh // 2 - 3, r.w - int(r.w * 0.45), 6))
+        bars.append(pygame.Rect(r.x + int(r.w * 0.45), r.y + rh // 2 - 3,
+                                r.w - int(r.w * 0.45), 6))
         y += rh
     y += 4
     bw = (pw - 20) // 3
-    btr = [pygame.Rect(x0 + 6 + (i % 3) * (bw + 4), y + (i // 3) * rh, bw, rh - 4) for i in range(len(BT))]
+    btr = [pygame.Rect(x0 + 6 + (i % 3) * (bw + 4), y + (i // 3) * rh, bw, rh - 4)
+           for i in range(len(BT))]
     prect = pygame.Rect(x0, y0, pw, y + ((len(BT) + 2) // 3) * rh + 4 - y0)
     bg = pygame.Surface(prect.size, pygame.SRCALPHA)
     bg.fill((10, 12, 20, 205))
@@ -590,15 +644,15 @@ def run_pygame() -> None:
         elif Q.sub > 1:
             Q.sub = 1
             say("FPS baixo: física simplificada")
-        elif na[None] > 20000:
-            na[None] = max(20000, int(na[None] * 0.6))
-            say(f"FPS baixo: {na[None]:,} partículas")
+        elif sim.na[None] > 20000:
+            sim.na[None] = max(20000, int(sim.na[None] * 0.6))
+            say(f"FPS baixo: {sim.na[None]:,} partículas")
         else:
             st["maxed"] = True
             say("Ainda lento: rode com --quality low")
 
     log.info(KEYS)
-    load(1 if A.preset is Preset.SINGLE else 2)
+    load_scene(sim, 1 if A.preset is Preset.SINGLE else 2)
     ex = Extras()
     t_start = time.time()
     slow = 0.0
@@ -619,9 +673,9 @@ def run_pygame() -> None:
                 k = e.key
                 if k == pygame.K_ESCAPE: running = False
                 elif k == pygame.K_SPACE: tog("pause")
-                elif k == pygame.K_r: reset()
-                elif k == pygame.K_1: load(1, preserve_palette=True)
-                elif k == pygame.K_2: load(2, preserve_palette=True)
+                elif k == pygame.K_r: sim.reset()
+                elif k == pygame.K_1: load_scene(sim, 1, preserve_palette=True)
+                elif k == pygame.K_2: load_scene(sim, 2, preserve_palette=True)
                 elif k == pygame.K_p: cyc()
                 elif k == pygame.K_v: tog("v3d")
                 elif k == pygame.K_a: tog("audio")
@@ -632,7 +686,7 @@ def run_pygame() -> None:
                 elif k == pygame.K_q:
                     S.bloom = 1.2 if A.bloom_enabled else 0.0
                     Q.sub = A.substeps
-                    na[None] = N
+                    sim.na[None] = sim.N
                     st["maxed"] = False
                     say("qualidade restaurada")
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
@@ -666,14 +720,14 @@ def run_pygame() -> None:
         if S.v3d and st["drag"] != "cam":
             cam[0] += 0.004
 
-        push()
-        sim(mpos[0] / H, 1 - mpos[1] / H, mode)
+        push_state(sim, ren)
+        sim.tick(mpos[0] / H, 1 - mpos[1] / H, mode, Q.sub)
         lap("sim")
-        splat3d(*cam) if S.v3d else splat()
-        post_pygame()
+        ren.splat3d(*cam) if S.v3d else ren.splat()
+        ren.post_pygame(S.bloom)
         lap("render")
 
-        arr = outu.to_numpy()
+        arr = ren.outu.to_numpy()
         lap("xfer")
         frame_surf = pygame.image.frombuffer(arr, (W, H), "RGB")
         screen.blit(frame_surf, (0, 0))
@@ -687,15 +741,18 @@ def run_pygame() -> None:
 
         if S.panel:
             screen.blit(bg, prect.topleft)
-            txt(f"{fps:.0f} FPS  |  {int(na[None]):,} partículas", (x0 + 8, y0 + 2), (140, 150, 175))
+            txt(f"{fps:.0f} FPS  |  {int(sim.na[None]):,} partículas",
+                (x0 + 8, y0 + 2), (140, 150, 175))
             for i, (k, l, lo, hi) in enumerate(SL):
                 r, bar = slr[i], bars[i]
                 val = getattr(S, k)
                 t = (val - lo) / (hi - lo)
                 txt(f"{l} {val:.2f}", (r.x, r.y + 1))
                 pygame.draw.rect(screen, (38, 42, 58), bar, border_radius=3)
-                pygame.draw.rect(screen, (108, 124, 255), (bar.x, bar.y, int(bar.w * t), bar.h), border_radius=3)
-                pygame.draw.circle(screen, (235, 238, 255), (bar.x + int(bar.w * t), bar.centery), 5)
+                pygame.draw.rect(screen, (108, 124, 255),
+                                 (bar.x, bar.y, int(bar.w * t), bar.h), border_radius=3)
+                pygame.draw.circle(screen, (235, 238, 255),
+                                   (bar.x + int(bar.w * t), bar.centery), 5)
             for i, (l, _, key) in enumerate(BT):
                 r = btr[i]
                 active = key is not None and getattr(S, key)
@@ -727,11 +784,11 @@ def run_pygame() -> None:
 
 
 # ================================================================ UI GGUI
-def panel(w, fps: float) -> bool:
-    w.text(f"FPS: {fps:.0f}   Partículas: {N:,}")
-    if w.button("Galáxia única"): load(1, preserve_palette=True)
-    if w.button("Colisão de galáxias"): load(2, preserve_palette=True)
-    if w.button("Reiniciar (R)"): reset()
+def panel(w, fps: float, sim: Simulation) -> bool:
+    w.text(f"FPS: {fps:.0f}   Partículas: {sim.N:,}")
+    if w.button("Galáxia única"): load_scene(sim, 1, preserve_palette=True)
+    if w.button("Colisão de galáxias"): load_scene(sim, 2, preserve_palette=True)
+    if w.button("Reiniciar (R)"): sim.reset()
     S.pause = w.checkbox("Pausar (espaço)", S.pause)
     S.g = w.slider_float("Gravidade", S.g, 0.1, 1.5)
     S.halo = w.slider_float("Halo escuro", S.halo, 0.0, 1.5)
@@ -747,14 +804,15 @@ def panel(w, fps: float) -> bool:
     return w.button("Screenshot")
 
 
-def run_ggui() -> None:
+def run_ggui(sim: Simulation, ren: Renderer) -> None:
+    W, H = ren.W, ren.H
     win = ti.ui.Window("Galaxy GPU", (W, H), vsync=True)
     canvas, gui = win.get_canvas(), win.get_gui()
     scene, cam = ti.ui.Scene(), ti.ui.Camera()
     cam.position(0, 0.55, 1.15)
     cam.lookat(0, 0, 0)
     cam.up(0, 1, 0)
-    load(1 if A.preset is Preset.SINGLE else 2)
+    load_scene(sim, 1 if A.preset is Preset.SINGLE else 2)
     ex = Extras()
     shot = False
     t0 = time.perf_counter()
@@ -769,27 +827,29 @@ def run_ggui() -> None:
             elif e.key == "h":
                 S.panel = not S.panel
             elif e.key == "r":
-                reset()
+                sim.reset()
         mx, my = win.get_cursor_pos()
         busy = S.panel and mx < 0.29 and my > 0.18
         mode = 0 if (busy or S.v3d) else 1 if win.is_pressed(ti.ui.LMB) else -1 if win.is_pressed(ti.ui.RMB) else 0
-        push()
-        sim(mx * ASP, my, mode)
+        push_state(sim, ren)
+        sim.tick(mx * sim.ASP, my, mode, Q.sub)
         if S.v3d:
             canvas.set_background_color((0.01, 0.01, 0.03))
             cam.track_user_inputs(win, movement_speed=0.02, hold_key=ti.ui.RMB)
             scene.set_camera(cam)
             scene.ambient_light((1, 1, 1))
-            scene.particles(p3, radius=0.0016, per_vertex_color=col)
+            scene.particles(sim.p3, radius=0.0016, per_vertex_color=sim.col)
             canvas.scene(scene)
         else:
-            draw2d()
-            canvas.set_image(out)
+            ren.splat()
+            ren.post_ggui(S.bloom)
+            canvas.set_image(ren.out)
             if ex.rec:
-                ex.write(np.ascontiguousarray((out.to_numpy().transpose(1, 0, 2)[::-1] * 255).astype(np.uint8)))
+                ex.write(np.ascontiguousarray(
+                    (ren.out.to_numpy().transpose(1, 0, 2)[::-1] * 255).astype(np.uint8)))
         if S.panel:
             with gui.sub_window("Galáxia", 0.01, 0.01, 0.27, 0.8) as w:
-                shot = panel(w, fps)
+                shot = panel(w, fps, sim)
         if shot:
             try:
                 win.save_image(f"galaxy_{stamp()}.png")
@@ -805,4 +865,9 @@ def run_ggui() -> None:
 # ================================================================ MAIN
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    run_ggui() if A.ui is UIMode.GGUI else run_pygame()
+    sim = Simulation(A)
+    ren = Renderer(A, sim)
+    if A.ui is UIMode.GGUI:
+        run_ggui(sim, ren)
+    else:
+        run_pygame(sim, ren)
