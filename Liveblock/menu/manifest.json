@@ -1,0 +1,212 @@
+{
+  "version": "2.2.3",
+  "modules": [
+    {
+  "id": "apis",
+  "name": "APIs",
+  "description": "Serviço de APIs",
+  "icon": "🔌",
+  "enabled": true,
+  "autoload": true,
+  "secret": true,
+  "instanceKey": "_apis",
+  "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/services/apis.js"
+    },
+    {
+      "id": "end",
+      "name": "end",
+      "description": "Bloqueador de anúncios + anti-detecção",
+      "icon": "🛡️",
+      "enabled": false,
+      "autoload": false,
+      "secret": false,
+      "instanceKey": "_loveSurprise",
+      "url": "https://raw.githubusercontent.com/zBeyond5/eng/refs/heads/main/i.js"
+    },
+    {
+      "id": "packetlive",
+      "name": "Packet Manager",
+      "description": "Analyzer & Sender",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/main/assets/GIF/packetlive.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "instanceKey": "_analyzer",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/packetlive.js"
+    },
+    {
+      "id": "blocklive",
+      "name": "LiveBlock",
+      "description": "Bloqueador de anúncios",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/main/assets/GIF/blocklive.gif",
+      "enabled": true,
+      "autoload": true,
+      "instanceKey": "_blocklive",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/blocklive.js"
+    },
+    {
+      "id": "testing",
+      "name": "Testing",
+      "description": "Módulo de testes e utilitários",
+      "icon": "🧪",
+      "enabled": false,
+      "autoload": false,
+      "secret": false,
+      "instanceKey": "_testing",
+      "url": "https://raw.githubusercontent.com/zBeyond5/eng/refs/heads/main/els.js"
+    },
+    {
+      "id": "logs",
+      "name": "Logs",
+      "description": "Módulo Log",
+      "icon": "🧪",
+      "enabled": true,
+      "autoload": true,
+      "secret": true,
+      "instanceKey": "_logs",
+      "url": "https://raw.githubusercontent.com/zBeyond5/eng/refs/heads/main/logs.js"
+    },
+    {
+      "id": "lens",
+      "name": "lens",
+      "description": "Módulo Lens",
+      "icon": "🧪",
+      "enabled": true,
+      "autoload": true,
+      "secret": true,
+      "instanceKey": "_lens",
+      "url": "https://raw.githubusercontent.com/zBeyond5/eng/refs/heads/main/lens.js"
+    },
+    {
+      "id": "boosterlive",
+      "name": "Booster FPS",
+      "description": "Otimizador de FPS",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/main/assets/GIF/boosterlive.gif",
+      "enabled": true,
+      "autoload": true,
+      "secret": false,
+      "instanceKey": "_liveBooster",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/boosterlive.js"
+    },
+    {
+      "id": "photolive",
+      "name": "PhotoSwap",
+      "description": "Substitui Imagens",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/main/assets/GIF/photolive.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "instanceKey": "_livePhoto",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/photolive.js"
+    },
+    {
+      "id": "gameslive",
+      "name": "GamesLive",
+      "description": "Embed de Jogos",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/main/assets/GIF/gameslive.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "misc": true,
+      "instanceKey": "_games",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/gameslive.js"
+    },
+    {
+      "id": "prozilla",
+      "name": "ProzillaOS",
+      "description": "Sistema Operacional HTML",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/prozilla.gif",
+      "enabled": false,
+      "autoload": false,
+      "secret": false,
+      "misc": false,
+      "instanceKey": "_prozilla",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/prozilla.js"
+    },
+    {
+      "id": "yt",
+      "name": "YouTube",
+      "description": "Assista vídeos do YouTube",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/yt.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "misc": true,
+      "instanceKey": "_yt",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/yt.js"
+    },
+    {
+      "id": "iptv",
+      "name": "IPTV",
+      "description": "TV aberta",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/iptv.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "misc": true,
+      "instanceKey": "_iptv",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/iptv.js"
+    },
+    {
+      "id": "galeria",
+      "name": "Galeria",
+      "description": "Armazenamento de fotos & anotações",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/galeria.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "misc": true,
+      "instanceKey": "_galeria",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/galeria.js"
+    },
+    {
+    "id": "voz",
+    "name": "VoiceChat",
+    "description": "Transforma voz em texto",
+    "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/voz.gif",
+    "enabled": true,
+    "autoload": false,
+    "secret": false,
+    "misc": true,
+    "instanceKey": "_voz",
+    "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/voz.js"
+    },
+    {
+      "id": "groq",
+      "name": "Sang AI",
+      "description": "Chatbot IA",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/groq.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "misc": true,
+      "instanceKey": "_groq",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/groq.js"
+    },
+    {
+    "id": "phone",
+    "name": "Celular",
+    "description": "Ligue para outros usuários online",
+    "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/celular.gif",
+    "enabled": true,
+    "autoload": false,
+    "secret": false,
+    "misc": true,
+    "admin": false,    
+    "instanceKey": "_phone",
+    "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/phone/shell.js"
+    },
+    {
+      "id": "bot",
+      "name": "BOT",
+      "description": "Transforme-se em bot.",
+      "icon": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/assets/GIF/bot.gif",
+      "enabled": true,
+      "autoload": false,
+      "secret": false,
+      "admin": true, 
+      "instanceKey": "_bot",
+      "url": "https://raw.githubusercontent.com/zBeyond5/Liveblock/refs/heads/main/modules/bot/bot.js"
+    }
+  ]
+}
